@@ -5,7 +5,7 @@ import sbt.Keys._
 import com.github.israel.sbt.zookeeper.{ZookeeperPluginMeta => ZPM}
 
 /**
-  * Created by israel on 28/12/2015.
+  * Created by Israel Klein on 28/12/2015.
   */
 object SbtZookeeperPlugin extends sbt.AutoPlugin{
 
@@ -27,12 +27,64 @@ object SbtZookeeperPlugin extends sbt.AutoPlugin{
     lazy val startZookeeper = taskKey[Unit]("start the zookeeper server")
     lazy val stopZookeeper = taskKey[Unit]("stop the zookeeper server")
     lazy val cleanZookeeper = taskKey[Unit]("clean zookeeper run dir")
+    lazy val cleanZookeeperFunc = taskKey[()=>Unit]("return a function that clean zookeeper's run dir")
 
   }
 
   import autoImport._
 
-  var zookeeperProcess:java.lang.Process = _
+  var zookeeperProcess:java.lang.Process = null
+
+
+  private def doCleanZookeeperBeforeTest = Def.taskDyn{
+    streams.value.log.error("doCleanZookeeperBeforeTests")
+    if(cleanBeforeTests.value)
+      cleanZookeeper
+    else
+      Def.task{}
+  }
+
+  private def doCleanZookeeperAfterTest = Def.taskDyn{
+    streams.value.log.error("doCleanZookeeperAfterTests")
+    if(cleanAfterTests.value)
+      cleanZookeeper
+    else
+      Def.task{}
+  }
+
+  private def doStartZookeeperBeforeTest = Def.taskDyn{
+    streams.value.log.error("doStartZookeeperBeforeTests")
+    if(startBeforeTests.value)
+      startZookeeper
+    else
+      Def.task{}
+  }
+
+  private def doStopZookeeperAfterTest = Def.taskDyn{
+    streams.value.log.error("doStopZookeeperBeforeTests")
+    if(stopAfterTests.value)
+      stopZookeeper
+    else
+      Def.task{}
+  }
+
+  private def isZookeeperRunning:Boolean = {
+    val p = sys.runtime.exec("jps -l")
+    val lines = io.Source.fromInputStream(p.getInputStream).getLines()
+    lines.exists(_.contains("org.apache.zookeeper.server.quorum.QuorumPeerMain"))
+  }
+
+  private def killZookeeper(force:Boolean = false)(implicit logger:Logger) = {
+    val p = sys.runtime.exec("jps -l")
+    val lines = io.Source.fromInputStream(p.getInputStream).getLines()
+    val pidOpt = lines.collectFirst({case s if (s.contains("org.apache.zookeeper.server.quorum.QuorumPeerMain")) => s.split(" ")(0)})
+    pidOpt match {
+      case Some(pid) =>
+        val command = if(force)s"kill -9 $pid" else s"kill $pid"
+        sys.runtime.exec(command)
+      case None => logger.debug("requested to kill zookeeper process but none was found")
+    }
+  }
 
   override def projectSettings = Seq(
 
@@ -57,41 +109,79 @@ object SbtZookeeperPlugin extends sbt.AutoPlugin{
 
     /** Tasks **/
     startZookeeper := {
-      val baseDir = zookeeperServerRunDir.value
-      if(!baseDir.isDirectory)
-        baseDir.mkdir()
-      val depClasspath = (dependencyClasspath in Runtime).value
-      val classpath = Attributed.data(depClasspath)
-      val serverConfigFile = zookeeperServerConfig.value
-      if(!serverConfigFile.exists()){
-        val resourcesJar = classpath.find{_.getName.startsWith("sbt-zookeeper-plugin")}
-        IO.withTemporaryDirectory{ tmpDir =>
-          IO.unzip(resourcesJar.get, tmpDir)
-          IO.copyFile(tmpDir / "zookeeper.server.cfg", serverConfigFile)
+      val logger = streams.value.log
+        logger.info("preparing to start ZooKeeper")
+      if(isZookeeperRunning)
+        logger.info("zookeeper is already running. doing nothing")
+      else {
+        val baseDir = zookeeperServerRunDir.value
+        if (!baseDir.isDirectory)
+          baseDir.mkdir()
+        val depClasspath = (dependencyClasspath in Runtime).value
+        val classpath = Attributed.data(depClasspath)
+        val serverConfigFile = zookeeperServerConfig.value
+        if (!serverConfigFile.exists()) {
+          val resourcesJar = classpath.find {
+            _.getName.startsWith("sbt-zookeeper-plugin")
+          }
+          IO.withTemporaryDirectory { tmpDir =>
+            IO.unzip(resourcesJar.get, tmpDir)
+            IO.copyFile(tmpDir / "zookeeper.server.cfg", serverConfigFile)
+          }
+        }
+
+        val configFile = serverConfigFile.absolutePath
+        val cp = classpath.map {
+          _.getAbsolutePath
+        }.mkString(":")
+        val javaExec = System.getProperty("java.home") + "/bin/java"
+        val mainClass = "org.apache.zookeeper.server.quorum.QuorumPeerMain"
+        val pb = new java.lang.ProcessBuilder(javaExec, "-classpath", cp, mainClass, configFile).inheritIO()
+        pb.directory(baseDir)
+        zookeeperProcess = pb.start()
+        // This is a temp solution for waiting for zookeeper to be ready
+        Thread.sleep(10000)
+        if(isZookeeperRunning)
+          logger.info("successfuly started zookeeper process")
+        else {
+          logger.error("failed to start zookeeper process")
+          sys.error("failed to start zookeeper process")
         }
       }
-
-      val configFile = serverConfigFile.absolutePath
-      val cp = classpath.map{_.getAbsolutePath}.mkString(":")
-      val javaExec = System.getProperty("java.home") + "/bin/java"
-      val mainClass = "org.apache.zookeeper.server.quorum.QuorumPeerMain"
-      val pb = new java.lang.ProcessBuilder( javaExec, "-classpath", cp, mainClass, configFile)
-      pb.directory(baseDir)
-      zookeeperProcess = pb.start()
     },
 
     stopZookeeper := {
-      zookeeperProcess.destroy()
+      implicit val logger = streams.value.log
+      logger.info("preparing to stop zookeeper process")
+      if(zookeeperProcess != null)
+        zookeeperProcess.destroy()
+      else
+        killZookeeper()
       var triesLeft = 20
-      while(zookeeperProcess.isAlive && triesLeft > 0) {
+      while(isZookeeperRunning && triesLeft > 0) {
+        logger.info("waiting 500ms for zookeeper process to finish...")
         Thread.sleep(500)
         triesLeft -= 1
       }
+      if(triesLeft == 0) {
+        logger.error("failed to stop zookeeper process nicely, using the heavy guns...")
+        killZookeeper(true)
+        logger.info("zookeeper process was forcefully killed (-9)")
+      } else {
+        logger.info("zookeeper process successfully stopped")
+      }
+      zookeeperProcess = null
     },
 
     cleanZookeeper := {
-      val dir = zookeeperServerRunDir.value
-      IO.delete(dir)
+      cleanZookeeperFunc.value()
+    },
+
+    cleanZookeeperFunc := {
+      () => {
+        val dir = zookeeperServerRunDir.value
+        IO.delete(dir)
+      }
     }
   )
 
